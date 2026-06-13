@@ -2,7 +2,7 @@
  "name": "bifrost",
   "version": "1.0.0",
   "description": "Bifrost Multi-Agent AI Interface",
-  "author": "FROGGY", 
+  "author": "FROGGY <froggy@example.com>", 
   "main": "main.js",
   "scripts": {
     "start": "electron .",
