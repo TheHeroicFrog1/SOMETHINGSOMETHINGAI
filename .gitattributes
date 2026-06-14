@@ -1,4 +1,20 @@
-# Force correct language detection
+# Force Language Detection
 *.js linguist-language=JavaScript
 *.jsx linguist-language=JavaScript
 *.py linguist-language=Python
+
+# Exclude generated/dependency files from stats
+node_modules/* linguist-vendored
+frontend/node_modules/** linguist-vendored
+build/** linguist-vendored
+package-lock.json linguist-vendored
+frontend/dist/** linguist-generated
+release/** linguist-generated
+backend/dist/** linguist-generated
+backend/build/** linguist-generated
+backend/.venv/** linguist-vendored
+docs/.vitepress/dist/** linguist-generated
+docs/.vitepress/cache/** linguist-generated
+
+# Prevent HTML files from skewing the language stats
+*.html linguist-generated
