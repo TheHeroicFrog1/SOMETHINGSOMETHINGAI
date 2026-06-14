@@ -52,6 +52,7 @@ function App() {
   const currentMessages = activeProject ? activeProject.messages : [];
   const [contextMenu, setContextMenu] = useState({ visible: false, x: 0, y: 0, projectId: null });
   const [promptModal, setPromptModal] = useState({ visible: false, title: '', value: '', type: '', data: null });
+  const [showBufferManager, setShowBufferManager] = useState(false);
 
   // 3. Dynamic Model Discovery States
   const [availableModels, setAvailableModels] = useState([]);
@@ -60,7 +61,9 @@ function App() {
 
   // 4. Client Inputs & Mentions autocomplete
   const [input, setInput] = useState('');
+  const [attachedFiles, setAttachedFiles] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const activeBufferLimitMb = activeProject ? (activeProject.bufferLimitMb || 100) : 100;
   const [showMentionList, setShowMentionList] = useState(false);
   const [mentionFilter, setMentionFilter] = useState('');
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
@@ -122,7 +125,7 @@ function App() {
   };
 
   // Helper to sync project messages & stats to DB
-  const syncProjectMessages = async (projectId, messages, tokenUsage, filesIndexed, contextLines) => {
+  const syncProjectMessages = async (projectId, messages, tokenUsage, filesIndexed, contextLines, bufferLimitMb) => {
     try {
       await fetch(`http://localhost:8000/api/chats/${projectId}/messages`, {
         method: 'POST',
@@ -131,7 +134,8 @@ function App() {
           messages: messages,
           tokenUsage: tokenUsage !== undefined ? tokenUsage : null,
           filesIndexed: filesIndexed !== undefined ? filesIndexed : null,
-          contextLines: contextLines !== undefined ? contextLines : null
+          contextLines: contextLines !== undefined ? contextLines : null,
+          bufferLimitMb: bufferLimitMb !== undefined ? bufferLimitMb : null
         })
       });
     } catch (err) {
@@ -341,7 +345,7 @@ function App() {
   const chatEndRef = useRef(null);
 
   // 6. Active Directory Indicator State
-  const [activeDir, setActiveDir] = useState('C:\\Users\\default\\workspace');
+  const [activeDir, setActiveDir] = useState('');
 
   // 7. Hardware & Datasets Diagnostics
   const [datasets, setDatasets] = useState([]);
@@ -521,13 +525,13 @@ function App() {
   };
 
   const handleCreateProject = () => {
-    setPromptModal({ visible: true, title: 'ENTER NEW SYSTEM WORKSPACE CODE IDENTIFIER:', value: '', type: 'create_workspace', data: null });
+    setPromptModal({ visible: true, title: 'Name Workspace:', value: '', type: 'create_workspace', data: null });
   };
 
   const handleRenameProject = (id) => {
     const proj = projects.find(p => p.id === id);
     if (!proj) return;
-    setPromptModal({ visible: true, title: 'ENTER NEW WORKSPACE NAME:', value: proj.name, type: 'rename_workspace', data: { id, oldName: proj.name } });
+    setPromptModal({ visible: true, title: 'Rename Workspace:', value: proj.name, type: 'rename_workspace', data: { id, oldName: proj.name } });
   };
 
   const handlePromptSubmit = async () => {
@@ -639,7 +643,12 @@ function App() {
   };
   
   useEffect(() => {
-    const handleClick = () => setContextMenu(prev => ({ ...prev, visible: false }));
+    const handleClick = () => {
+      setContextMenu(prev => {
+        if (!prev.visible) return prev;
+        return { ...prev, visible: false };
+      });
+    };
     window.addEventListener('click', handleClick);
     return () => window.removeEventListener('click', handleClick);
   }, []);
@@ -698,60 +707,106 @@ function App() {
     }
   };
 
-  // Parses attached text files directly into the active chat session context
+  // Stages files to be attached to the next user message
   const handleFileAttachment = (e) => {
     const file = e.target.files[0];
     if (!file) return;
     
     const reader = new FileReader();
-    reader.onload = (event) => {
-      const textContent = event.target.result || "";
-      const lineCount = textContent.split('\n').length;
-      const fileSize = file.size;
-      
-      const systemMsg = {
-        role: 'system',
-        content: `[SYS_INDEXER]: Attached file "${file.name}" (${fileSize} bytes, ${lineCount} lines) mounted. Context index vector compiled into current chat session memory.`
+    if (file.type.startsWith('image/')) {
+      reader.readAsDataURL(file);
+      reader.onload = (event) => {
+        setAttachedFiles(prev => [...prev, { type: 'image', url: event.target.result, name: file.name }]);
       };
-      
-      const targetProj = projects.find(p => p.id === activeProjectId);
-      if (targetProj) {
-        const updatedMsg = [...targetProj.messages, systemMsg];
-        const newFilesIndexed = targetProj.filesIndexed + 1;
-        const newContextLines = targetProj.contextLines + lineCount;
-        const newTokenUsage = Math.min(200000, targetProj.tokenUsage + fileSize);
-        
-        setProjects(prev => prev.map(p => {
-          if (p.id === activeProjectId) {
-            return {
-              ...p,
-              filesIndexed: newFilesIndexed,
-              contextLines: newContextLines,
-              tokenUsage: newTokenUsage,
-              messages: updatedMsg
-            };
-          }
-          return p;
-        }));
-        
-        syncProjectMessages(activeProjectId, updatedMsg, newTokenUsage, newFilesIndexed, newContextLines);
-      }
-      alert(`Ingestion SUCCESS: Mounted "${file.name}" into workspace context memory.`);
-    };
-    reader.onerror = (err) => {
-      console.error("[ERROR] Failed to read attachment:", err);
-      alert("[PANIC] Core file reader failed to ingest attached file.");
-    };
-    reader.readAsText(file);
+    } else {
+      reader.readAsText(file);
+      reader.onload = (event) => {
+        setAttachedFiles(prev => [...prev, { type: 'text', content: event.target.result, name: file.name }]);
+      };
+    }
+    e.target.value = '';
   };
 
-  const handleSetDirectory = () => {
-    setPromptModal({ visible: true, title: 'ENTER NEW ACTIVE SYSTEM WORKING DIRECTORY PATH:', value: activeDir, type: 'change_dir', data: null });
+  const handleSetDirectory = async () => {
+    if (window.require) {
+      try {
+        const { ipcRenderer } = window.require('electron');
+        const selectedPath = await ipcRenderer.invoke('select-directory');
+        if (selectedPath) {
+          const res = await fetch('http://localhost:8000/api/workspace/directory', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: selectedPath })
+          });
+          
+          if (res.ok) {
+            const resData = await res.json();
+            setActiveDir(resData.directory);
+            const systemMsg = {
+              role: 'system',
+              content: `[SYS_EVENT]: Active working directory updated to: "${resData.directory}". Found ${resData.files_count} file indexes.`
+            };
+            
+            const targetProj = projects.find(p => p.id === activeProjectId);
+            if (targetProj) {
+              const updatedMsg = [...targetProj.messages, systemMsg];
+              setProjects(prev => prev.map(p => {
+                if (p.id === activeProjectId) {
+                  return { ...p, filesIndexed: resData.files_count, messages: updatedMsg };
+                }
+                return p;
+              }));
+              syncProjectMessages(activeProjectId, updatedMsg);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to set directory via IPC:", err);
+      }
+    } else {
+      // Fallback for non-Electron environments (dev mode in browser)
+      try {
+        const pickRes = await fetch('http://localhost:8000/api/workspace/pick-directory');
+        if (pickRes.ok) {
+          const pickData = await pickRes.json();
+          if (pickData.directory) {
+            const res = await fetch('http://localhost:8000/api/workspace/directory', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: pickData.directory })
+            });
+            if (res.ok) {
+              const resData = await res.json();
+              setActiveDir(resData.directory);
+              const systemMsg = { role: 'system', content: `[SYS_EVENT]: Active working directory updated to: "${resData.directory}". Found ${resData.files_count} file indexes.` };
+              const targetProj = projects.find(p => p.id === activeProjectId);
+              if (targetProj) {
+                const updatedMsg = [...targetProj.messages, systemMsg];
+                setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, filesIndexed: resData.files_count, messages: updatedMsg } : p));
+                syncProjectMessages(activeProjectId, updatedMsg);
+              }
+            }
+          }
+        } else {
+          setPromptModal({ visible: true, title: 'Set Working Directory', value: activeDir || '', type: 'change_dir', data: null });
+        }
+      } catch (err) {
+        setPromptModal({ visible: true, title: 'Set Working Directory', value: activeDir || '', type: 'change_dir', data: null });
+      }
+    }
   };
 
   // Structured System Panic & Markdown Stream Evaluation Node
   const parseTerminalText = (text) => {
-    if (!text) return '';
+    if (Array.isArray(text)) {
+      return text.map((item, index) => {
+        if (item.type === 'text') return <div key={index} style={{ marginBottom: '10px' }}>{parseTerminalText(item.text)}</div>;
+        if (item.type === 'image_url') return <img key={index} src={item.image_url.url} alt="User attachment" style={{ maxWidth: '100%', maxHeight: '400px', borderRadius: '5px', marginTop: '10px' }} />;
+        return null;
+      });
+    }
+
+    if (!text || typeof text !== 'string') return '';
     let cleanedText = text;
 
     if (cleanedText.includes('[ERROR]:') || cleanedText.includes('HTTP Error') || cleanedText.includes('[CRITICAL ROUTING FAILURE]') || cleanedText.includes('429')) {
@@ -914,10 +969,12 @@ function App() {
 
   // Sequential Multi-Agent chat executor loop
   const handleSendMessage = async () => {
-    if (!input.trim() || isGenerating || visibleAvailableModels.length === 0) return;
+    if ((!input.trim() && attachedFiles.length === 0) || isGenerating || visibleAvailableModels.length === 0) return;
 
     const rawInput = input;
+    const currentFiles = [...attachedFiles];
     setInput('');
+    setAttachedFiles([]);
     setShowMentionList(false);
     setIsGenerating(true);
 
@@ -934,7 +991,18 @@ function App() {
     }
 
     // 2. Add user message block
-    const userMsg = { role: 'user', content: rawInput };
+    let messageContent;
+    if (currentFiles.length > 0) {
+      messageContent = [];
+      if (rawInput.trim()) messageContent.push({ type: "text", text: rawInput });
+      currentFiles.forEach(f => {
+        if (f.type === 'image') messageContent.push({ type: "image_url", image_url: { url: f.url } });
+        else messageContent.push({ type: "text", text: `[FILE: ${f.name}]\n${f.content}` });
+      });
+    } else {
+      messageContent = rawInput;
+    }
+    const userMsg = { role: 'user', content: messageContent };
     let currentHistory = [...currentMessages, userMsg];
     setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, messages: currentHistory } : p));
     
@@ -978,6 +1046,9 @@ function App() {
 
       let finalTokenUsage = activeProject ? (activeProject.tokenUsage || 0) : 0;
       try {
+        const baseSysPrompt = modelPersonalities[activeModelObj.id] || systemPrompt || "";
+        const injectedSysPrompt = activeDir ? `[SYSTEM CONTEXT]\nCurrent Active Directory: ${activeDir}\n\n${baseSysPrompt}` : baseSysPrompt;
+        
         const response = await fetch('http://localhost:8000/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -990,7 +1061,7 @@ function App() {
             custom_url: activeModelObj.customUrl ? sanitizeHost(activeModelObj.customUrl) : undefined,
             temperature: parseFloat(temperature) || 0.7,
             max_tokens: parseInt(maxTokens) || 4096,
-            system_prompt: modelPersonalities[activeModelObj.id] || systemPrompt || undefined,
+            system_prompt: injectedSysPrompt || undefined,
             capabilities: toggles,
             files_indexed: activeProject ? activeProject.filesIndexed : 0,
             context_lines: activeProject ? activeProject.contextLines : 0
@@ -1028,7 +1099,7 @@ function App() {
                   provider: activeModelObj.provider 
                 };
 
-                finalTokenUsage = Math.min(200000, finalTokenUsage + usageInc);
+                finalTokenUsage = Math.min((activeBufferLimitMb * 1024 * 1024), finalTokenUsage + usageInc);
 
                 setProjects(prev => prev.map(p => {
                   if (p.id === activeProjectId) {
@@ -1322,7 +1393,7 @@ function App() {
             )}
           </div>
           
-          <div className="top-bar-right">
+          <div className="top-bar-right" style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
             {currentView === 'chat' ? (
               <>
                 <button className="retro-btn" onClick={(e) => { e.stopPropagation(); handleExportLogs(); }} title="Export message history">
@@ -1381,6 +1452,8 @@ function App() {
                       </div>
                       <span style={{ fontSize: '0.8rem', color: 'var(--accent-red)' }}>* Restart required after changing</span>
                     </div>
+                    
+
                   </div>
                 </div>
               </div>
@@ -2036,14 +2109,32 @@ function App() {
               </div>
             )}
 
-            <div className="input-area">
-              <div className="input-box">
+            <div className="input-area" style={{ flexDirection: 'column', gap: '10px' }}>
+              {attachedFiles.length > 0 && (
+                <div style={{ display: 'flex', gap: '10px', width: '100%', overflowX: 'auto', paddingBottom: '5px' }}>
+                  {attachedFiles.map((f, i) => (
+                    <div key={i} style={{ position: 'relative', border: '1px solid var(--terminal-green)', padding: '5px', backgroundColor: 'var(--bg-dark-blue)', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      {f.type === 'image' ? (
+                        <img src={f.url} alt="attached" style={{ height: '40px', maxWidth: '80px', objectFit: 'contain' }} />
+                      ) : (
+                        <div style={{ fontSize: '24px' }}>📄</div>
+                      )}
+                      <div style={{ fontSize: '0.8rem', maxWidth: '100px', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>{f.name}</div>
+                      <button 
+                        style={{ position: 'absolute', top: '-5px', right: '-5px', background: 'var(--accent-red)', color: 'white', border: 'none', borderRadius: '50%', width: '18px', height: '18px', fontSize: '10px', cursor: 'pointer', display: 'flex', justifyContent: 'center', alignItems: 'center' }}
+                        onClick={() => setAttachedFiles(prev => prev.filter((_, idx) => idx !== i))}
+                      >✕</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="input-box" style={{ width: '100%' }}>
                 <input 
                   type="file" 
                   ref={fileInputRef} 
                   style={{ display: 'none' }} 
                   onChange={handleFileAttachment} 
-                  accept=".txt,.csv,.json,.py,.js,.html,.css,.md"
+                  accept=".txt,.csv,.json,.py,.js,.html,.css,.md,image/*"
                 />
                 <div className="input-icons">
                   <span style={{ cursor: 'pointer', color: 'var(--terminal-green)' }} onClick={() => fileInputRef.current?.click()} title="Add file">📎</span>
@@ -2081,6 +2172,56 @@ function App() {
         )}
       </div>
 
+      {/* --- BUFFER MANAGER MODAL --- */}
+      {showBufferManager && (
+        <div className="modal-overlay" onClick={() => setShowBufferManager(false)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ width: '500px', maxWidth: '90%' }}>
+            <h2 style={{ marginTop: 0, color: 'var(--accent-red)' }}>Manage Context Buffer</h2>
+            <p style={{ color: 'var(--text-dim)', fontSize: '0.9rem', marginBottom: '20px' }}>
+              Selectively remove ingested files from the AI's active workspace memory.
+            </p>
+            <div style={{ maxHeight: '300px', overflowY: 'auto', border: '1px solid var(--panel-border)', backgroundColor: 'var(--panel-bg)', borderRadius: '4px', padding: '10px' }}>
+              {currentMessages.filter(m => m.role === 'system' && m.content.startsWith('[SYS_INDEXER]: Attached file')).length === 0 ? (
+                <div style={{ color: 'var(--text-dim)', textAlign: 'center', padding: '20px' }}>Buffer is clear.</div>
+              ) : (
+                currentMessages.map((m, idx) => {
+                  if (m.role === 'system' && m.content.startsWith('[SYS_INDEXER]: Attached file')) {
+                    const match = m.content.match(/Attached file "(.*?)" \(([0-9]+) bytes, ([0-9]+) lines\)/);
+                    if (match) {
+                      const name = match[1];
+                      const bytes = parseInt(match[2]);
+                      const lines = parseInt(match[3]);
+                      return (
+                        <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px', borderBottom: '1px solid var(--panel-border)' }}>
+                          <div>
+                            <strong style={{ color: 'var(--terminal-green)' }}>{name}</strong>
+                            <div style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{bytes} bytes | {lines} lines</div>
+                          </div>
+                          <button className="retro-btn" onClick={() => {
+                            const updatedMsg = currentMessages.filter((_, msgIdx) => msgIdx !== idx);
+                            const newFilesIndexed = Math.max(0, activeProject.filesIndexed - 1);
+                            const newContextLines = Math.max(0, activeProject.contextLines - lines);
+                            const newTokenUsage = Math.max(0, activeProject.tokenUsage - bytes);
+                            setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, filesIndexed: newFilesIndexed, contextLines: newContextLines, tokenUsage: newTokenUsage, messages: updatedMsg } : p));
+                            syncProjectMessages(activeProjectId, updatedMsg, newTokenUsage, newFilesIndexed, newContextLines, activeProject.bufferLimitMb);
+                          }} style={{ borderColor: 'var(--accent-red)', color: 'var(--accent-red)', fontSize: '0.8rem', padding: '2px 8px' }}>
+                            REMOVE
+                          </button>
+                        </div>
+                      );
+                    }
+                  }
+                  return null;
+                })
+              )}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
+              <button className="retro-btn" onClick={() => setShowBufferManager(false)}>DONE</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 3. RIGHT SIDEBAR */}
       {rightOpen && currentView === 'chat' && (
         <div className="right-sidebar" onClick={(e) => e.stopPropagation()}>
@@ -2099,9 +2240,45 @@ function App() {
                       <span style={{ color: 'var(--terminal-amber)' }}>📁</span>
                       <span style={{ fontSize: '1.2rem', fontWeight: 'bold' }}>{activeProject ? activeProject.name : 'Workspace'}</span>
                     </div>
-                    <div style={{ fontSize: '0.95rem', color: 'var(--text-dim)', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                      <div>Files Indexed: {activeProject ? activeProject.filesIndexed : 0} files</div>
-                      <div>Reference Metrics: {activeProject ? activeProject.contextLines : 0} reference metrics</div>
+                    <div style={{ fontSize: '0.95rem', color: 'var(--text-dim)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div style={{ wordBreak: 'break-all' }}>
+                        <strong>Active Dir:</strong> {activeDir || 'None (Clear)'}
+                      </div>
+                      <div style={{ display: 'flex', gap: '10px' }}>
+                        <button className="retro-btn" onClick={(e) => { e.stopPropagation(); handleSetDirectory(); }} style={{ fontSize: '0.8rem', padding: '2px 8px' }}>
+                          SET PATH
+                        </button>
+                        <button className="retro-btn" onClick={(e) => { e.stopPropagation(); document.getElementById('context-file-upload').click(); }} style={{ fontSize: '0.8rem', padding: '2px 8px' }}>
+                          + ADD FILE TO CONTEXT
+                        </button>
+                        <input type="file" id="context-file-upload" style={{ display: 'none' }} onChange={(e) => {
+                          const file = e.target.files[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = (event) => {
+                            const textContent = event.target.result || "";
+                            const lineCount = textContent.split('\n').length;
+                            const fileSize = file.size;
+                            const systemMsg = {
+                              role: 'system',
+                              content: `[SYS_INDEXER]: Attached file "${file.name}" (${fileSize} bytes, ${lineCount} lines) mounted. Context index vector compiled into current chat session memory.`
+                            };
+                            const targetProj = projects.find(p => p.id === activeProjectId);
+                            if (targetProj) {
+                              const updatedMsg = [...targetProj.messages, systemMsg];
+                              const newFilesIndexed = targetProj.filesIndexed + 1;
+                              const newContextLines = targetProj.contextLines + lineCount;
+                              const newTokenUsage = Math.min((activeBufferLimitMb * 1024 * 1024), targetProj.tokenUsage + fileSize);
+                              setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, filesIndexed: newFilesIndexed, contextLines: newContextLines, tokenUsage: newTokenUsage, messages: updatedMsg } : p));
+                              syncProjectMessages(activeProjectId, updatedMsg, newTokenUsage, newFilesIndexed, newContextLines);
+                            }
+                            alert(`SUCCESS: Added "${file.name}" to context buffer.`);
+                          };
+                          reader.readAsText(file);
+                        }} />
+                      </div>
+                      <div style={{ marginTop: '5px' }}>Files Indexed: {activeProject ? activeProject.filesIndexed : 0} files</div>
+                      <div>Reference Metrics: {activeProject ? activeProject.contextLines : 0} reference lines</div>
                     </div>
                   </div>
                 </div>
@@ -2110,12 +2287,42 @@ function App() {
                   <div className="card-title">Buffer Usage</div>
                   <div className="retro-card">
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '1.1rem' }}>
-                      <span>{((activeProject && activeProject.tokenUsage) || 0).toLocaleString()} / 200,000 bytes</span>
-                      <span style={{ color: 'var(--accent-red)' }}>{Math.min(100, Math.round((((activeProject && activeProject.tokenUsage) || 0) / 200000) * 100))}%</span>
+                      <span>{((activeProject && activeProject.tokenUsage) || 0).toLocaleString()} / {(activeBufferLimitMb * 1024 * 1024).toLocaleString()} bytes</span>
+                      <span style={{ color: 'var(--accent-red)' }}>{Math.min(100, Math.round((((activeProject && activeProject.tokenUsage) || 0) / (activeBufferLimitMb * 1024 * 1024)) * 100))}%</span>
                     </div>
                     <div className="progress-bg">
-                      <div className="progress-fill" style={{ width: `${Math.min(100, (((activeProject && activeProject.tokenUsage) || 0) / 200000) * 100)}%` }}></div>
+                      <div className="progress-fill" style={{ width: `${Math.min(100, (((activeProject && activeProject.tokenUsage) || 0) / (activeBufferLimitMb * 1024 * 1024)) * 100)}%` }}></div>
                     </div>
+                    
+                    <div style={{ marginTop: '15px', display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                      <label style={{ fontSize: '0.9rem', color: 'var(--text-dim)' }}>Workspace Buffer Limit (MB):</label>
+                      <input 
+                        type="number" 
+                        min="1"
+                        max="1024"
+                        value={activeBufferLimitMb} 
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          if (val > 0) {
+                            setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, bufferLimitMb: val } : p));
+                            syncProjectMessages(activeProjectId, currentMessages, activeProject.tokenUsage, activeProject.filesIndexed, activeProject.contextLines, val);
+                          }
+                        }} 
+                        style={{ 
+                          width: '100%', 
+                          boxSizing: 'border-box',
+                          backgroundColor: 'var(--bg-color)',
+                          color: 'var(--text-light)',
+                          border: '1px solid var(--panel-border)',
+                          padding: '6px 10px',
+                          borderRadius: '4px',
+                          fontFamily: 'monospace'
+                        }} 
+                      />
+                    </div>
+                    <button className="retro-btn" onClick={(e) => { e.stopPropagation(); setShowBufferManager(true); }} style={{ marginTop: '15px', width: '100%', fontSize: '0.9rem' }}>
+                      MANAGE BUFFER CONTENT
+                    </button>
                   </div>
                 </div>
               </>

@@ -6,6 +6,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "dev": "cd frontend && npm run dev",
     "build:frontend": "cd frontend && npm install && npm run build",
     "build:backend:win": "cd backend && python -m PyInstaller --name bifrost-backend --noconsole --onefile main.py",
     "build:backend:mac": "cd backend && python -m PyInstaller --name bifrost-backend --onefile main.py",
@@ -64,7 +65,7 @@
     }
   },
   "devDependencies": {
-    "electron": "^29.0.0",
+    "electron": "^29.4.6",
     "electron-builder": "^24.9.1",
     "vitepress": "^1.6.4"
   }

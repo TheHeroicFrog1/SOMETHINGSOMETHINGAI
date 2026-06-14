@@ -147,6 +147,11 @@ body {
   border-bottom: 4px solid var(--panel-border);
   background-color: var(--panel-blue);
   min-height: 46px;
+  -webkit-app-region: drag;
+}
+
+.top-bar button, .top-bar select {
+  -webkit-app-region: no-drag;
 }
 
 .top-bar-left {
@@ -200,6 +205,10 @@ body {
   min-width: 0;
   max-width: 280px;
   text-overflow: ellipsis;
+}
+
+input.project-selector {
+  cursor: text;
 }
 
 .chat-feed {

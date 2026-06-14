@@ -79,13 +79,27 @@ function startBackend() {
   return new Promise((resolve, reject) => {
     const { path: backendPath, isDev } = getBackendPath();
 
-    if (isDev) {
-      console.log('Running in development mode. Make sure backend is running on port 8000.');
-      resolve();
-      return;
-    }
+    let spawnCmd;
+    let spawnArgs;
 
-    console.log('Starting backend:', backendPath);
+    if (isDev) {
+      console.log('Running in development mode. Automatically spawning Python backend...');
+      // Use venv Python for reliability if available
+      const venvPython = path.join(__dirname, '.venv', 'Scripts', 'python.exe');
+      const venvPythonUnix = path.join(__dirname, '.venv', 'bin', 'python');
+      if (fs.existsSync(venvPython)) {
+        spawnCmd = venvPython;
+      } else if (fs.existsSync(venvPythonUnix)) {
+        spawnCmd = venvPythonUnix;
+      } else {
+        spawnCmd = 'python';
+      }
+      spawnArgs = [path.join(__dirname, 'backend', 'main.py')];
+    } else {
+      console.log('Starting compiled backend:', backendPath);
+      spawnCmd = backendPath;
+      spawnArgs = [];
+    }
     
     let env = { ...process.env };
     let settings = getSettings();
@@ -93,20 +107,66 @@ function startBackend() {
       env.BIFROST_DATA_PATH = settings.dataPath;
     }
 
-    backendProcess = spawn(backendPath, [], { windowsHide: true, stdio: 'ignore', env });
+    // Attempt to start local Ollama engine automatically
+    try {
+      const { exec } = require('child_process');
+      const ollamaEnv = { ...process.env, OLLAMA_ORIGINS: "*" };
+      exec('ollama serve', { windowsHide: true, env: ollamaEnv }, (err) => {
+        // If it fails, Ollama is likely already running or not installed. We can safely ignore.
+      });
+      console.log('Sent start signal to Ollama service (if installed).');
+    } catch (e) {
+      console.log('Failed to start Ollama automatically:', e);
+    }
 
-    backendProcess.on('error', (err) => {
-      console.error('Failed to start backend:', err);
-      dialog.showErrorBox('Backend Error', `Failed to start the backend server:\n${err.message}`);
-      reject(err);
-    });
+    let restartTimestamps = [];
 
-    backendProcess.on('exit', (code) => {
-      console.log(`Backend process exited with code ${code}`);
-      if (!isQuitting && code !== 0 && code !== null) {
-        dialog.showErrorBox('Backend Crash', `The backend server crashed (code: ${code}). The app may not function correctly.`);
+    const launchProcess = () => {
+      const now = Date.now();
+      restartTimestamps = restartTimestamps.filter(ts => now - ts < 10000);
+      
+      if (restartTimestamps.length >= 5) {
+        console.error("Backend process crashed 5 times within 10 seconds. Halting auto-restart to prevent boot loops.");
+        dialog.showErrorBox('Fatal Error', 'The backend server crashed repeatedly and could not be recovered. Please check the logs.');
+        return;
       }
-    });
+      restartTimestamps.push(now);
+
+      backendProcess = spawn(spawnCmd, spawnArgs, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env });
+
+      if (backendProcess.stdout) {
+        backendProcess.stdout.on('data', (data) => {
+          console.log(`[Backend] ${data.toString().trim()}`);
+        });
+      }
+      if (backendProcess.stderr) {
+        backendProcess.stderr.on('data', (data) => {
+          console.error(`[Backend Error] ${data.toString().trim()}`);
+        });
+      }
+
+      backendProcess.on('error', (err) => {
+        console.error('Failed to start backend:', err);
+        dialog.showErrorBox('Backend Error', `Failed to start the backend server:\n${err.message}`);
+        reject(err);
+      });
+
+      backendProcess.on('exit', (code) => {
+        console.log(`Backend process exited with code ${code}`);
+        if (!isQuitting) {
+          console.log("Auto-restarting backend server...");
+          // If backend crashes, restart it. We also try to ensure Ollama is up again
+          try {
+            const { exec } = require('child_process');
+            const ollamaEnv = { ...process.env, OLLAMA_ORIGINS: "*" };
+            exec('ollama serve', { windowsHide: true, env: ollamaEnv }, () => {});
+          } catch(e) {}
+          setTimeout(launchProcess, 2000); // Auto-restart after 2 seconds
+        }
+      });
+    };
+
+    launchProcess();
 
     // Wait for the backend to start accepting connections
     const checkPort = () => {
@@ -121,6 +181,7 @@ function startBackend() {
         setTimeout(checkPort, 500);
       });
       socket.on('error', () => {
+        socket.destroy();
         setTimeout(checkPort, 500);
       });
       socket.connect(8000, '127.0.0.1');

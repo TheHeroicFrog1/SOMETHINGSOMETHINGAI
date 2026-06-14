@@ -23,15 +23,33 @@ import tempfile
 import sqlite3
 import platform
 
+import tkinter as tk
+from tkinter import filedialog
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/api/workspace/pick-directory")
+async def pick_directory():
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        folder_path = filedialog.askdirectory()
+        root.destroy()
+        if folder_path:
+            return {"directory": folder_path}
+        else:
+            return {"directory": None}
+    except Exception as e:
+        return {"error": str(e)}
 
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -41,33 +59,37 @@ def map_error_to_friendly(status_code: int, error_message: str, provider: Option
     
     # Check if this request targets a local or cloud runner
     is_local = True
-    if provider in ["openai", "gemini", "anthropic"]:
-        is_local = False
-    elif base_url:
+    
+    # Identify known cloud domains
+    if base_url:
         base_url_lower = base_url.lower()
-        if "localhost" not in base_url_lower and "127.0.0.1" not in base_url_lower:
+        if any(cloud_domain in base_url_lower for cloud_domain in ["api.openai.com", "googleapis.com", "anthropic.com"]):
             is_local = False
             
-    # 1. Context limit
-    if any(k in err_msg_lower for k in ["token", "context_length", "context length", "context limit", "max_tokens", "window full"]):
-        return {
-            "category": "context_limit",
-            "title": "Context Window Full",
-            "actionable_suggestion": "The conversation has reached its limit. Click 'Reset Buffer' or start a new chat to clear the memory."
-        }
-    # 2. Authentication
-    elif status_code == 401 or any(k in err_msg_lower for k in ["unauthorized", "api key", "auth", "invalid key", "expired"]):
+    # If no base URL is provided, rely on provider name as a fallback
+    elif provider in ["openai", "gemini", "anthropic"]:
+        is_local = False
+            
+    # 1. Authentication
+    if status_code == 401 or any(k in err_msg_lower for k in ["unauthorized", "api key", "auth", "invalid key", "expired"]):
         return {
             "category": "authentication",
             "title": "Authentication Failed",
             "actionable_suggestion": "Your cloud provider API key seems invalid or expired. Please update it in the Model Setup panel."
         }
-    # 3. Rate Limit / 429
+    # 2. Rate Limit / 429
     elif status_code == 429 or any(k in err_msg_lower for k in ["rate limit", "too many requests", "429", "exhausted", "quota"]):
         return {
             "category": "rate_limit",
             "title": "Rate Limit Exceeded",
             "actionable_suggestion": "The API request limit has been reached. Please wait a moment before sending another message."
+        }
+    # 3. Context limit
+    elif any(k in err_msg_lower for k in ["context_length", "context length", "context limit", "max_tokens", "window full"]):
+        return {
+            "category": "context_limit",
+            "title": "Context Window Full",
+            "actionable_suggestion": "The conversation has reached its limit. Click 'Reset Buffer' or start a new chat to clear the memory."
         }
     # 4. Connection Timeout
     elif any(k in err_msg_lower for k in ["timeout", "timed out", "deadline"]):
@@ -84,12 +106,12 @@ def map_error_to_friendly(status_code: int, error_message: str, provider: Option
                 "actionable_suggestion": "Bifrost could not reach the cloud provider. Please check your internet connection, or verify that your API key in the Model Setup panel is valid and has available quota."
             }
     # 5. Connection failures / Local engine offline
-    elif any(k in err_msg_lower for k in ["connection failed", "offline", "unreachable", "refused", "server error", "503", "500"]):
+    elif any(k in err_msg_lower for k in ["connection failed", "offline", "unreachable", "refused", "server error", "503", "500", "502", "getaddrinfo"]):
         if is_local:
             return {
                 "category": "connection",
                 "title": "Connection Failed",
-                "actionable_suggestion": "Bifrost couldn't reach the model runner. Make sure your local engine (Ollama/LM Studio) is open and running."
+                "actionable_suggestion": "Bifrost couldn't reach the model runner. Make sure your local engine (Ollama/LM Studio) is open and running. Also check if the URL is correct."
             }
         else:
             return {
@@ -97,12 +119,26 @@ def map_error_to_friendly(status_code: int, error_message: str, provider: Option
                 "title": "Cloud API Connection Failed",
                 "actionable_suggestion": "Bifrost could not reach the cloud provider. Please check your internet connection, or verify that your API key in the Model Setup panel is valid and has available quota."
             }
-    # 6. Fallback
+    # 6. Model Not Found
+    elif status_code == 404 or "not found" in err_msg_lower:
+        return {
+            "category": "not_found",
+            "title": "Model Not Found",
+            "actionable_suggestion": "The requested model could not be found. If using Ollama, please pull the model using `ollama run <model_name>` first."
+        }
+    # 7. Bad Request / Invalid Parameters
+    elif status_code == 400 or any(k in err_msg_lower for k in ["bad request", "invalid", "validation"]):
+        return {
+            "category": "bad_request",
+            "title": "Invalid Request parameters",
+            "actionable_suggestion": "The engine rejected the request. Try adjusting your temperature, tokens, or system prompt."
+        }
+    # 8. Fallback
     else:
         return {
             "category": "unknown",
             "title": "Service Error",
-            "actionable_suggestion": "Something went wrong on our end. Please try again or restart the local server."
+            "actionable_suggestion": f"An unexpected error occurred ({status_code}). Please try again or restart the local server."
         }
 
 @app.exception_handler(HTTPException)
@@ -135,12 +171,14 @@ SYSTEM_SERVICES = [
 ]
 
 # Active working directory path state (persists in-memory)
-CURRENT_WORKDIR = os.path.abspath(os.getcwd())
+CURRENT_WORKDIR = ""
 
 # --- SYSTEM PLUMBING SCHEMAS ---
+from typing import Any
+
 class Message(BaseModel):
     role: str
-    content: str
+    content: Any
     model: Optional[str] = None
     provider: Optional[str] = None
 
@@ -219,6 +257,10 @@ async def fetch_available_models(req: FetchModelsRequest):
                 
             elif req.provider == "ollama":
                 host = req.local_host.rstrip("/") if req.local_host else "http://localhost:11434"
+                if not host.startswith("http"):
+                    host = f"http://{host}"
+                if "localhost" in host:
+                    host = host.replace("localhost", "127.0.0.1")
                 res = await client.get(f"{host}/api/tags", timeout=4.0)
                 if res.status_code == 200:
                     models = [m["name"] for m in res.json().get("models", [])]
@@ -228,6 +270,8 @@ async def fetch_available_models(req: FetchModelsRequest):
                 
             elif req.provider == "openai":
                 url = req.custom_url.rstrip("/") if req.custom_url else "https://api.openai.com/v1"
+                if url and not url.startswith("http"):
+                    url = f"http://{url}"
                 headers = {}
                 if req.api_key:
                     headers["Authorization"] = f"Bearer {req.api_key}"
@@ -251,6 +295,8 @@ async def fetch_available_models(req: FetchModelsRequest):
 
             elif req.provider == "custom":
                 custom_url = req.custom_url.rstrip("/") if req.custom_url else ""
+                if custom_url and not custom_url.startswith("http"):
+                    custom_url = f"http://{custom_url}"
                 if not custom_url:
                     return {"models": []}
                 headers = {}
@@ -277,6 +323,29 @@ async def fetch_available_models(req: FetchModelsRequest):
             print(f"[ERROR] Exception occurred in fetch_available_models: {str(e)}")
         return {"models": []}
 
+def generate_file_tree(startpath, max_depth=2, max_items=50):
+    if not startpath or not os.path.exists(startpath) or not os.path.isdir(startpath):
+        return ""
+    
+    tree_str = f"Directory Tree for {startpath}:\n"
+    item_count = 0
+    
+    for root, dirs, files in os.walk(startpath):
+        level = root.replace(startpath, '').count(os.sep)
+        if level > max_depth:
+            continue
+        indent = ' ' * 4 * (level)
+        tree_str += f"{indent}{os.path.basename(root)}/\n"
+        subindent = ' ' * 4 * (level + 1)
+        for f in files:
+            if item_count >= max_items:
+                tree_str += f"{subindent}... (truncated due to size)\n"
+                return tree_str
+            tree_str += f"{subindent}{f}\n"
+            item_count += 1
+            
+    return tree_str
+
 # --- UNIFIED COMPUTE PACKET CHANNELS ---
 async def stream_cloud_api(req: ChatRequest, base_url: str):
     base_url = base_url.rstrip("/")
@@ -300,8 +369,16 @@ async def stream_cloud_api(req: ChatRequest, base_url: str):
         headers["Authorization"] = f"Bearer {req.api_key}"
 
     formatted_messages = []
-    if req.system_prompt:
-        formatted_messages.append({"role": "system", "content": req.system_prompt})
+    
+    # Inject directory tree if available
+    sys_prompt = req.system_prompt or ""
+    if CURRENT_WORKDIR:
+        tree = generate_file_tree(CURRENT_WORKDIR)
+        if tree:
+            sys_prompt += f"\n\n[FILE SYSTEM AWARENESS]\nThe user is working in the following directory. You have read access to its structural layout:\n{tree}"
+    
+    if sys_prompt:
+        formatted_messages.append({"role": "system", "content": sys_prompt.strip()})
     
     # Safely iterate through chat history messages list
     for m in req.messages:
@@ -380,15 +457,21 @@ async def stream_cloud_api(req: ChatRequest, base_url: str):
 
 async def stream_local_ollama(req: ChatRequest):
     host = req.local_host.rstrip("/") if req.local_host else "http://localhost:11434"
+    if not host.startswith("http"):
+        host = f"http://{host}"
+    if "localhost" in host:
+        host = host.replace("localhost", "127.0.0.1")
 
     # Safely extract last message from incoming chat history list
     last_msg = ""
     if isinstance(req.messages, list) and req.messages:
         last_m = req.messages[-1]
-        if isinstance(last_m, dict):
-            last_msg = last_m.get("content", "").lower()
+        raw_content = last_m.get("content", "") if isinstance(last_m, dict) else getattr(last_m, "content", "")
+        if isinstance(raw_content, list):
+            texts = [part.get("text", "") for part in raw_content if part.get("type") == "text"]
+            last_msg = " ".join(texts).lower()
         else:
-            last_msg = getattr(last_m, "content", "").lower()
+            last_msg = str(raw_content).lower()
 
     if "trigger_panic" in last_msg or "rate_limit" in last_msg:
         err_payload = map_error_to_friendly(429, "rate_limit", provider="ollama", base_url=host)
@@ -397,18 +480,42 @@ async def stream_local_ollama(req: ChatRequest):
 
     formatted_messages = []
     for m in req.messages:
-        if isinstance(m, dict):
-            formatted_messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+        role = m.get("role", "user") if isinstance(m, dict) else getattr(m, "role", "user")
+        content = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
+        
+        if isinstance(content, list):
+            text_parts = []
+            images = []
+            for part in content:
+                if part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    url = part.get("image_url", {}).get("url", "")
+                    if url.startswith("data:image"):
+                        b64_str = url.split(",")[1] if "," in url else url
+                        images.append(b64_str)
+            
+            msg_obj = {"role": role, "content": "\n".join(text_parts)}
+            if images:
+                msg_obj["images"] = images
+            formatted_messages.append(msg_obj)
         else:
-            formatted_messages.append({"role": getattr(m, "role", "user"), "content": getattr(m, "content", "")})
+            formatted_messages.append({"role": role, "content": content})
 
+    # Inject directory tree if available
+    sys_prompt = req.system_prompt or ""
+    if CURRENT_WORKDIR:
+        tree = generate_file_tree(CURRENT_WORKDIR)
+        if tree:
+            sys_prompt += f"\n\n[FILE SYSTEM AWARENESS]\nThe user is working in the following directory. You have read access to its structural layout:\n{tree}"
+            
     payload = {
         "model": req.model,
         "messages": formatted_messages,
         "options": {"temperature": req.temperature, "num_predict": req.max_tokens}
     }
-    if req.system_prompt:
-         payload["messages"].insert(0, {"role": "system", "content": req.system_prompt})
+    if sys_prompt:
+         payload["messages"].insert(0, {"role": "system", "content": sys_prompt.strip()})
 
     async with httpx.AsyncClient() as client:
         try:
@@ -881,9 +988,16 @@ def init_db():
         filesIndexed INTEGER DEFAULT 0,
         contextLines INTEGER DEFAULT 0,
         tokenUsage INTEGER DEFAULT 0,
+        bufferLimitMb INTEGER DEFAULT 100,
         messages TEXT DEFAULT '[]'
     )
     """)
+    
+    # Run migrations
+    try:
+        cursor.execute("ALTER TABLE chats ADD COLUMN bufferLimitMb INTEGER DEFAULT 100")
+    except sqlite3.OperationalError:
+        pass # Column already exists
     
     # Insert default API configs if empty
     cursor.execute("SELECT COUNT(*) FROM api_configs")
@@ -917,8 +1031,8 @@ def init_db():
     cursor.execute("SELECT COUNT(*) FROM chats")
     if cursor.fetchone()[0] == 0:
         cursor.execute("""
-        INSERT INTO chats (id, name, timestamp, filesIndexed, contextLines, tokenUsage, messages)
-        VALUES ('w_default', 'Default Workspace', ?, 0, 0, 0, '[]')
+        INSERT INTO chats (id, name, timestamp, filesIndexed, contextLines, tokenUsage, bufferLimitMb, messages)
+        VALUES ('w_default', 'Default Workspace', ?, 0, 0, 0, 100, '[]')
         """, (time.time(),))
         
     conn.commit()
@@ -1062,7 +1176,7 @@ async def save_general_settings(settings: Dict[str, str]):
 async def get_chats():
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, timestamp, filesIndexed, contextLines, tokenUsage, messages FROM chats ORDER BY timestamp DESC")
+    cursor.execute("SELECT id, name, timestamp, filesIndexed, contextLines, tokenUsage, bufferLimitMb, messages FROM chats ORDER BY timestamp DESC")
     chats = []
     for row in cursor.fetchall():
         chats.append({
@@ -1072,7 +1186,8 @@ async def get_chats():
             "filesIndexed": row[3],
             "contextLines": row[4],
             "tokenUsage": row[5],
-            "messages": json.loads(row[6])
+            "bufferLimitMb": row[6],
+            "messages": json.loads(row[7])
         })
     conn.close()
     return chats
@@ -1083,6 +1198,7 @@ class ChatSessionSchema(BaseModel):
     filesIndexed: Optional[int] = 0
     contextLines: Optional[int] = 0
     tokenUsage: Optional[int] = 0
+    bufferLimitMb: Optional[int] = 100
     messages: Optional[List[Dict]] = []
 
 @app.post("/api/chats")
@@ -1091,15 +1207,16 @@ async def create_chat_session(chat: ChatSessionSchema):
     cursor = conn.cursor()
     try:
         cursor.execute("""
-        INSERT INTO chats (id, name, timestamp, filesIndexed, contextLines, tokenUsage, messages)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chats (id, name, timestamp, filesIndexed, contextLines, tokenUsage, bufferLimitMb, messages)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             filesIndexed=excluded.filesIndexed,
             contextLines=excluded.contextLines,
             tokenUsage=excluded.tokenUsage,
+            bufferLimitMb=excluded.bufferLimitMb,
             messages=excluded.messages
-        """, (chat.id, chat.name, time.time(), chat.filesIndexed, chat.contextLines, chat.tokenUsage, json.dumps(chat.messages)))
+        """, (chat.id, chat.name, time.time(), chat.filesIndexed, chat.contextLines, chat.tokenUsage, chat.bufferLimitMb, json.dumps(chat.messages)))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1113,13 +1230,14 @@ class MessagesUpdateSchema(BaseModel):
     tokenUsage: Optional[int] = None
     filesIndexed: Optional[int] = None
     contextLines: Optional[int] = None
+    bufferLimitMb: Optional[int] = None
 
 @app.post("/api/chats/{chat_id}/messages")
 async def update_chat_messages(chat_id: str, req: MessagesUpdateSchema):
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT filesIndexed, contextLines, tokenUsage FROM chats WHERE id = ?", (chat_id,))
+        cursor.execute("SELECT filesIndexed, contextLines, tokenUsage, bufferLimitMb FROM chats WHERE id = ?", (chat_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Chat session not found")
@@ -1127,12 +1245,13 @@ async def update_chat_messages(chat_id: str, req: MessagesUpdateSchema):
         files_idx = req.filesIndexed if req.filesIndexed is not None else row[0]
         context_lines = req.contextLines if req.contextLines is not None else row[1]
         token_usage = req.tokenUsage if req.tokenUsage is not None else row[2]
+        buffer_limit_mb = req.bufferLimitMb if req.bufferLimitMb is not None else row[3]
         
         cursor.execute("""
         UPDATE chats
-        SET messages = ?, filesIndexed = ?, contextLines = ?, tokenUsage = ?, timestamp = ?
+        SET messages = ?, filesIndexed = ?, contextLines = ?, tokenUsage = ?, bufferLimitMb = ?, timestamp = ?
         WHERE id = ?
-        """, (json.dumps(req.messages), files_idx, context_lines, token_usage, time.time(), chat_id))
+        """, (json.dumps(req.messages), files_idx, context_lines, token_usage, buffer_limit_mb, time.time(), chat_id))
         conn.commit()
     except HTTPException:
         raise
