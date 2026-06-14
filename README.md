@@ -13,8 +13,8 @@
 <hr />
 
 <div align="center">
-  <a href="build/demo.mp4">
-    <img src="build/icon.png" alt="Click to watch Bifrost Demo" width="600" />
+  <a href="https://raw.githubusercontent.com/TheHeroicFrog1/Bifrost/main/build/demo.mp4">
+    <img src="build/thumbnail.png" alt="Click to watch Bifrost Demo" width="800" />
   </a>
 </div>
 
