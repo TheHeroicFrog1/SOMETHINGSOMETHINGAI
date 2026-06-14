@@ -1,0 +1,4 @@
+# Force correct language detection
+*.js linguist-language=JavaScript
+*.jsx linguist-language=JavaScript
+*.py linguist-language=Python
